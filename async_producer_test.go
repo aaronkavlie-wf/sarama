@@ -74,125 +74,50 @@ func (p testPartitioner) feed(partition int32) {
 	p <- &partition
 }
 
+// The simplest case of multiple topics, multiple partitions, and multiple brokers (but no retries)
 func TestAsyncProducer(t *testing.T) {
-	seedBroker := newMockBroker(t, 1)
-	leader := newMockBroker(t, 2)
+	// Given
+	broker0 := newMockBroker(t, 0)
+	broker1 := newMockBroker(t, 1)
 
-	metadataResponse := new(MetadataResponse)
-	metadataResponse.AddBroker(leader.Addr(), leader.BrokerID())
-	metadataResponse.AddTopicPartition("my_topic", 0, leader.BrokerID(), nil, nil, ErrNoError)
-	seedBroker.Returns(metadataResponse)
+	broker0.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": newMockMetadataResponse(t).
+			SetBroker(broker0.Addr(), broker0.BrokerID()).
+			SetBroker(broker1.Addr(), broker1.BrokerID()).
+			SetLeader("topic0", 0, broker0.BrokerID()).
+			SetLeader("topic0", 1, broker1.BrokerID()).
+			SetLeader("topic1", 0, broker1.BrokerID()).
+			SetLeader("topic1", 1, broker0.BrokerID()),
+		"ProduceRequest": newMockProduceResponse(t),
+	})
 
-	prodSuccess := new(ProduceResponse)
-	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
-	leader.Returns(prodSuccess)
-
-	config := NewConfig()
-	config.Producer.Flush.Messages = 10
-	config.Producer.Return.Successes = true
-	producer, err := NewAsyncProducer([]string{seedBroker.Addr()}, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for i := 0; i < 10; i++ {
-		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Metadata: i}
-	}
-	for i := 0; i < 10; i++ {
-		select {
-		case msg := <-producer.Errors():
-			t.Error(msg.Err)
-			if msg.Msg.flags != 0 {
-				t.Error("Message had flags set")
-			}
-		case msg := <-producer.Successes():
-			if msg.flags != 0 {
-				t.Error("Message had flags set")
-			}
-			if msg.Metadata.(int) != i {
-				t.Error("Message metadata did not match")
-			}
-		}
-	}
-
-	closeProducer(t, producer)
-	leader.Close()
-	seedBroker.Close()
-}
-
-func TestAsyncProducerMultipleFlushes(t *testing.T) {
-	seedBroker := newMockBroker(t, 1)
-	leader := newMockBroker(t, 2)
-
-	metadataResponse := new(MetadataResponse)
-	metadataResponse.AddBroker(leader.Addr(), leader.BrokerID())
-	metadataResponse.AddTopicPartition("my_topic", 0, leader.BrokerID(), nil, nil, ErrNoError)
-	seedBroker.Returns(metadataResponse)
-
-	prodSuccess := new(ProduceResponse)
-	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
-	leader.Returns(prodSuccess)
-	leader.Returns(prodSuccess)
-	leader.Returns(prodSuccess)
+	broker1.SetHandlerByMap(map[string]MockResponse{
+		"ProduceRequest": newMockProduceResponse(t),
+	})
 
 	config := NewConfig()
-	config.Producer.Flush.Messages = 5
-	config.Producer.Return.Successes = true
-	producer, err := NewAsyncProducer([]string{seedBroker.Addr()}, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for flush := 0; flush < 3; flush++ {
-		for i := 0; i < 5; i++ {
-			producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
-		}
-		expectResults(t, producer, 5, 0)
-	}
-
-	closeProducer(t, producer)
-	leader.Close()
-	seedBroker.Close()
-}
-
-func TestAsyncProducerMultipleBrokers(t *testing.T) {
-	seedBroker := newMockBroker(t, 1)
-	leader0 := newMockBroker(t, 2)
-	leader1 := newMockBroker(t, 3)
-
-	metadataResponse := new(MetadataResponse)
-	metadataResponse.AddBroker(leader0.Addr(), leader0.BrokerID())
-	metadataResponse.AddBroker(leader1.Addr(), leader1.BrokerID())
-	metadataResponse.AddTopicPartition("my_topic", 0, leader0.BrokerID(), nil, nil, ErrNoError)
-	metadataResponse.AddTopicPartition("my_topic", 1, leader1.BrokerID(), nil, nil, ErrNoError)
-	seedBroker.Returns(metadataResponse)
-
-	prodResponse0 := new(ProduceResponse)
-	prodResponse0.AddTopicPartition("my_topic", 0, ErrNoError)
-	leader0.Returns(prodResponse0)
-
-	prodResponse1 := new(ProduceResponse)
-	prodResponse1.AddTopicPartition("my_topic", 1, ErrNoError)
-	leader1.Returns(prodResponse1)
-
-	config := NewConfig()
-	config.Producer.Flush.Messages = 5
+	config.Producer.Flush.Messages = 1
 	config.Producer.Return.Successes = true
 	config.Producer.Partitioner = NewRoundRobinPartitioner
-	producer, err := NewAsyncProducer([]string{seedBroker.Addr()}, config)
+	producer, err := NewAsyncProducer([]string{broker0.Addr()}, config)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
-		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
-	}
-	expectResults(t, producer, 10, 0)
+	// When
+	go func() {
+		for i := 0; i < 100; i++ {
+			producer.Input() <- &ProducerMessage{Topic: "topic0", Key: nil, Value: StringEncoder(TestMessage)}
+			producer.Input() <- &ProducerMessage{Topic: "topic1", Key: nil, Value: StringEncoder(TestMessage)}
+		}
+	}()
+
+	// Then
+	expectResults(t, producer, 200, 0)
 
 	closeProducer(t, producer)
-	leader1.Close()
-	leader0.Close()
-	seedBroker.Close()
+	broker0.Close()
+	broker1.Close()
 }
 
 func TestAsyncProducerCustomPartitioner(t *testing.T) {
